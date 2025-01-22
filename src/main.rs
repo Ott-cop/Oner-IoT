@@ -1,200 +1,194 @@
-use device::Device;
-use embassy_futures::select::{select, Either};
-use esp_idf_svc::{eventloop::EspSystemEventLoop, hal::{gpio::{InputOutput, InputPin, OutputPin, Pin, PinDriver}, prelude::Peripherals}, mqtt::client::{EspAsyncMqttClient, EspAsyncMqttConnection, EventPayload, MessageId, MqttClientConfiguration, QoS}, nvs::EspDefaultNvsPartition, sys::EspError, timer::{EspAsyncTimer, EspTaskTimerService, EspTimerService}, wifi::{AsyncWifi, ClientConfiguration, EspWifi}};
-use log::{info, error};
-use serde::{Deserialize, Serialize};
-use core::str;
-use std::{ pin::pin, sync::{Arc, RwLock}, time::Duration};
+use core::time::Duration;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
+use device::Device;
+use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::hal::gpio::{InputOutput, Pin, PinDriver};
+use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::mqtt::client::*;
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use esp_idf_svc::sys::{esp_task_wdt_deinit, EspError};
+use esp_idf_svc::wifi::*;
+
+use log::*;
+use serde_json::Value;
 pub mod device;
 
-const WIFI_SSID: &str = "TP-Link_DF5D";
-const WIFI_PASS: &str = "4444jhin";
 
-const MQTT_URL: &str = "mqtt://192.168.0.100:1883";
-const MQTT_CLIENT_ID: &str = "esp32";
-const MQTT_CLIENT_PASSWORD: &str = "12342234";
+const ENVCONFIGURATION: &str = include_str!("../env.json");
 
-#[derive(Deserialize, Serialize)]
-struct MsgReceived<'a> {
-    id: MessageId,
-    topic: Option<&'a str>,
-    data: &'a [u8]
-}
+const TOPIC_PIN_2: &str = "pin_2";
+const TOPIC_PIN_23: &str = "pin_23";
 
-
-fn main() {
-
-    esp_idf_svc::sys::link_patches();
-
-    esp_idf_svc::log::EspLogger::initialize_default();
-
+fn main() -> ! {
     unsafe {
-        esp_idf_svc::sys::esp_task_wdt_deinit();
-        esp_idf_svc::sys::esp_wifi_set_ps(esp_idf_svc::sys::wifi_ps_type_t_WIFI_PS_NONE);
+        esp_task_wdt_deinit();
     }
 
-    let sysloop = EspSystemEventLoop::take().unwrap();
-    let timer_service = EspTimerService::new().unwrap();
+	let env_configuration = serde_json::from_str::<Value>(ENVCONFIGURATION).expect("Problem to convert env.json");
+ 	let wifi_ssid: &str = env_configuration["WIFI_SSID"].as_str().expect("Not found WIFI_SSID enviroment variable!");
+    let wifi_pass: &str = env_configuration["WIFI_PASS"].as_str().expect("Not found WIFI_PASS enviroment variable!");
+	
+	let mqtt_url = env_configuration["MQTT_URL"].as_str().expect("Not found MQTT_URL enviroment variable!");
+	let mqtt_client_id = env_configuration["MQTT_CLIENT_ID"].as_str().expect("Not found MQTT_CLIENT_ID enviroment variable!");
+	let mqtt_client_pass = env_configuration["MQTT_CLIENT_PASS"].as_str().expect("Not found MQTT_CLIENT_PASS enviroment variable!");
+	
+    esp_idf_svc::sys::link_patches();
+    esp_idf_svc::log::EspLogger::initialize_default();
+
+
+    let sys_loop = EspSystemEventLoop::take().unwrap();
     let nvs = EspDefaultNvsPartition::take().unwrap();
     let peripherals = unsafe { Peripherals::new() };
 
-    let pin23 = io_pin(peripherals.pins.gpio23);
+    let _wifi = wifi_create(&sys_loop, &nvs, wifi_ssid, wifi_pass).unwrap();
 
-    esp_idf_svc::hal::task::block_on(async {
-        let _wifi_create = wifi_create(&sysloop, &timer_service, &nvs).await.unwrap();
-        info!("Wifi Created!");
+    let (client, mut conn) = mqtt_create(mqtt_url, mqtt_client_id, mqtt_client_pass).unwrap();
+ 
+    let client = Arc::new(Mutex::new(client));
+    let c1 = client.clone();
 
-        let (mut client, mut conn) = mqtt_create(MQTT_URL, MQTT_CLIENT_ID, MQTT_CLIENT_PASSWORD).unwrap();
-        info!("MQTT Client Created!");
+    let pin_driver_2 = Arc::new(Mutex::new(PinDriver::input_output(peripherals.pins.gpio2).unwrap()));
+    let pin_driver_23 = Arc::new(Mutex::new(PinDriver::input_output(peripherals.pins.gpio23).unwrap()));
 
-        let mut timer = timer_service.timer_async().unwrap();
-        run(Arc::clone(&pin23), &mut client, &mut conn, &mut timer, "changeState").await
-    }).unwrap();
+    let (mut tx1, rx1) = channel::<String>();
+    let (mut tx2, rx2) = channel::<String>();
+
+    subscribe(c1);
     
+    runner(rx1, pin_driver_2);
+    runner(rx2, pin_driver_23);
+   
+    message_distributor((&mut tx1, TOPIC_PIN_2), (&mut tx2, TOPIC_PIN_23), &mut conn);
+    
+    loop {}
 }
 
-fn io_pin<'a, P: Pin + OutputPin + InputPin>(pin: P) ->  Arc<RwLock<PinDriver<'a, P, InputOutput>>> {
-    Arc::new(RwLock::new(PinDriver::input_output(pin).unwrap())) 
+
+macro_rules! setup_subscribe {
+    ($client:expr, $( $topic:expr ),*) => {
+        $(
+            if let Err(err) = $client.subscribe($topic, QoS::AtMostOnce) {
+                info!("Problem to connect to topic: {err} - \"{}\"", $topic);
+                thread::sleep(Duration::from_millis(2000));
+                continue;
+            }
+        )*
+    };
 }
 
-async fn run<T: InputPin + OutputPin>(
-    pin: Arc<RwLock<PinDriver<'_, T, InputOutput>>>,
-    client: &mut EspAsyncMqttClient,
-    connection: &mut EspAsyncMqttConnection,
-    timer: &mut EspAsyncTimer,
-    topic: &str,
-) -> Result<(), EspError> {
-    info!("About to start the MQTT client");
-    let pin_reference = pin.clone();
-    let pin_reference2 = pin.clone();
-    
-    let res = select(
-        pin!(async move {
-            info!("MQTT Listening for messages");
+fn subscribe(
+    client: Arc<Mutex<EspMqttClient<'static>>>
+) {
+    thread::spawn(move || {
+        loop {
+            {
+                let mut client = client.lock().unwrap();
+                info!("Trying to connect to topics");
 
-            while let Ok(event) = connection.next().await{
-                
-                if let EventPayload::Received{ id, topic, data, details } = event.payload() {
-                    let mut pin = pin_reference.write().unwrap();
-                    let raw_json = str::from_utf8(data).unwrap();
-                    info!("ID > {}", id);
-                    info!("Topico > {:#?}", topic);
-                    info!("Detalhes > {:#?}", details);
+                setup_subscribe!(client, TOPIC_PIN_2, TOPIC_PIN_23);
+            }  
+            info!("Subscribed to all topics");
+            thread::sleep(Duration::from_millis(5000));
+        }
+    });
+}
 
-                    if let Ok(device) = serde_json::from_str::<Device>(raw_json) {
-                        println!("{}", device.state);
-                        
-                        if topic == Some("changeState") {
-                            if device.state == true {
-                                (*pin).set_high().unwrap(); 
-                            } else {
-                                (*pin).set_low().unwrap(); 
-                            }
-                            
-                        }
-                    }
-                }
+fn message_distributor(
+    tx: (&mut Sender<String>, &str),
+    tx2: (&mut Sender<String>, &str),
+    conn: &mut EspMqttConnection
+) {
+    loop {
+        let Ok(event) = conn.next() else {
+            continue;
+        };
+        if let EventPayload::Received { topic, data, .. } = event.payload() {
+            let raw_json = core::str::from_utf8(data).unwrap().to_owned();
+            info!("Topic Received: {topic:#?}");
+            match topic {
+                Some(TOPIC_PIN_2) => tx.0.send(raw_json).unwrap(),
+                Some(TOPIC_PIN_23) => tx2.0.send(raw_json).unwrap(),
+                _ => info!("Cannot find this topic")
             }
-
-            info!("Connection closed");
-
-            Ok(())
-        }),
-        pin!(async move {
-            loop {
-                if let Err(e) = client.subscribe(topic, QoS::AtMostOnce).await {
-                    error!("Failed to subscribe to topic \"{topic}\": {e}, retrying...");
-
-                    timer.after(Duration::from_millis(500)).await?;
-
-                    continue;
-                }
-
-                info!("Subscribed to topic \"{topic}\"");
-
-                timer.after(Duration::from_millis(500)).await?; 
-
-                loop {
-                    
-                    let pin2 = pin_reference2.read().unwrap();
-                    let payload = Device {
-                        id: 0,
-                        pin: (*pin2).pin().clone(),
-                        state: (*pin2).is_high().clone()
-                    };
-                    drop(pin2);
-
-                    client
-                        .publish(topic, QoS::AtMostOnce, false, serde_json::to_string(&payload).unwrap().as_bytes())
-                        .await?;
-
-                    info!("Published \"{payload:#?}\" to topic \"{topic}\"");
-
-                    let sleep_secs = 2;
-
-                    info!("Now sleeping for {sleep_secs}s...");
-                    timer.after(Duration::from_secs(sleep_secs)).await?;
-                }
-            }
-        }),
-    )
-    .await;
-
-    match res {
-        Either::First(res) => res,
-        Either::Second(res) => res,
+        }
     }
 }
 
-fn mqtt_create(
+fn runner<P: Pin>(
+    rx: Receiver<String>,
+    pin_driver: Arc<Mutex<PinDriver<'static, P, InputOutput>>>
+) {
+    thread::spawn(move || {
+        loop {
+            if let Ok(value) = rx.recv() {
+                let Ok(device) = serde_json::from_str::<Device>(value.as_str()) else {
+                    info!("Impossible to parse data!");
+                    continue;
+                };
+                info!("Device: {device:#?}");
+                if device.state == true {
+                    let mut pin_driver = pin_driver.lock().unwrap();
+                    _ = pin_driver.set_high();
+                } else {
+                    let mut pin_driver = pin_driver.lock().unwrap();
+                    _ = pin_driver.set_low();
+                }
+            } 
+        }
+    });
+
+}
+
+fn mqtt_create<'a>(
     url: &str,
     client_id: &str,
     client_pass: &str
-) -> Result<(EspAsyncMqttClient, EspAsyncMqttConnection), EspError> {
-    
-    let (mqtt_client, mqtt_conn) = EspAsyncMqttClient::new(&url, &MqttClientConfiguration {
-        client_id: Some(&client_id),
-        username: Some(&client_id),
-        password: Some(&client_pass),
-        client_certificate: None,
-        server_certificate: None,
-        ..Default::default()
-    }).unwrap();
-
-    println!("{} {}", client_id, client_pass);
+) -> Result<(EspMqttClient<'static>, EspMqttConnection), EspError> {
+    let (mqtt_client, mqtt_conn) = EspMqttClient::new(
+        url,
+        &MqttClientConfiguration {
+            client_id: Some(client_id),
+            username: Some(client_id),
+            password: Some(client_pass),
+            protocol_version: Some(MqttProtocolVersion::V3_1_1),
+            server_certificate: None,
+            client_certificate: None,
+            ..Default::default()
+        },
+    )?;
 
     Ok((mqtt_client, mqtt_conn))
 }
 
-
-async fn wifi_create(
-    sysloop: &EspSystemEventLoop,
-    timer: &EspTaskTimerService,
-    nvs: &EspDefaultNvsPartition
-
+fn wifi_create(
+    sys_loop: &EspSystemEventLoop,
+    nvs: &EspDefaultNvsPartition,
+    wifi_ssid: &str,
+    wifi_pass: &str
 ) -> Result<EspWifi<'static>, EspError> {
-    let peripherals = Peripherals::take().unwrap();
+    let peripherals = Peripherals::take()?;
 
-    let mut esp_wifi = EspWifi::new(peripherals.modem, sysloop.clone(), Some(nvs.clone())).unwrap();
+    let mut esp_wifi = EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs.clone()))?;
+    let mut wifi = BlockingWifi::wrap(&mut esp_wifi, sys_loop.clone())?;
 
-    let mut wifi = AsyncWifi::wrap(&mut esp_wifi, sysloop.clone(), timer.clone()).unwrap();
-
-    wifi.set_configuration(&esp_idf_svc::wifi::Configuration::Client(ClientConfiguration {
-        ssid: WIFI_SSID.try_into().unwrap(),
-        password: WIFI_PASS.try_into().unwrap(),
+    wifi.set_configuration(&Configuration::Client(ClientConfiguration {
+        ssid: wifi_ssid.try_into().unwrap(),
+        password: wifi_pass.try_into().unwrap(),
+        auth_method: AuthMethod::WPA2Personal,
         ..Default::default()
-    })).unwrap();
+    }))?;
 
-    wifi.start().await.unwrap();
-    info!("Starting wifi...");
+    wifi.start()?;
+    info!("Wifi started");
 
-    wifi.connect().await.unwrap();
-    info!("Connecting to {}.", WIFI_SSID);
+    wifi.connect()?;
+    info!("Wifi connected");
 
-    wifi.wait_netif_up().await.unwrap();
-    info!("Wifi Connected!");
+    wifi.wait_netif_up()?;
+    info!("Wifi netif up");
 
     Ok(esp_wifi)
 }
-
