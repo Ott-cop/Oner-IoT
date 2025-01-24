@@ -1,26 +1,33 @@
-use core::time::Duration;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
-use std::thread;
-
-use device::Device;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::hal::gpio::{InputOutput, Pin, PinDriver};
+use esp_idf_svc::hal::gpio::PinDriver;
 use esp_idf_svc::hal::peripherals::Peripherals;
-use esp_idf_svc::mqtt::client::*;
-use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::sys::{esp_task_wdt_deinit, EspError};
-use esp_idf_svc::wifi::*;
-
-use log::*;
+use esp_idf_svc::nvs::{EspCustomNvsPartition, EspDefaultNvsPartition, EspNvs};
+use esp_idf_svc::sys::esp_task_wdt_deinit;
+use log::info;
+use mqtt::mqtt_client::mqtt_create;
+use mqtt::subscribe::subscribe;
 use serde_json::Value;
+use storage::storage::Storage;
+use wifi::wifi::wifi_create;
+use mqtt::mqtt_runner::{message_distributor, runner};
+use device::{call_device_state, Device};
+use serde::{Serialize, Deserialize};
 pub mod device;
-
+pub mod wifi;
+pub mod mqtt;
+pub mod storage;
 
 const ENVCONFIGURATION: &str = include_str!("../env.json");
 
 const TOPIC_PIN_2: &str = "pin_2";
 const TOPIC_PIN_23: &str = "pin_23";
+
+const NAMESPACE: &str = "devices_data";
+const DEVICES_TAG: &str = "devices_tag";
+
+devices_layout!(pin_2, pin_23);
 
 fn main() -> ! {
     unsafe {
@@ -38,10 +45,48 @@ fn main() -> ! {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
-
     let sys_loop = EspSystemEventLoop::take().unwrap();
     let nvs = EspDefaultNvsPartition::take().unwrap();
     let peripherals = unsafe { Peripherals::new() };
+    let nvs_data_partition = EspCustomNvsPartition::take("nvs_data").expect("Problem to use nvs_data partition! Restarting...");
+    
+    let nvs_data = Arc::new(Mutex::new(Storage::new(EspNvs::new(nvs_data_partition, NAMESPACE, true).expect("Problem to create a NVS Instance..."))));
+    let nvs_data_clone1 = nvs_data.clone();
+    let nvs_data_clone2 = nvs_data.clone();
+
+    let pin_driver_2 = Arc::new(Mutex::new(PinDriver::input_output(peripherals.pins.gpio2).unwrap()));
+    let pd_2 = pin_driver_2.clone();
+
+    let pin_driver_23 = Arc::new(Mutex::new(PinDriver::input_output(peripherals.pins.gpio23).unwrap()));
+    let pd_23 = pin_driver_23.clone();
+
+    {
+        let mut nvs_data = nvs_data.lock().unwrap();
+        let try_get = nvs_data.get(DEVICES_TAG);
+
+        if let Err(err) = try_get {
+            panic!("[ERROR] {err}");
+        } 
+        else if let Ok(Some(data)) = try_get {
+            info!("Found data from NVS!");
+            
+            let devices_json = serde_json::from_str::<LayoutDataDevice>(data.as_str()).expect("Impossible to parse data");
+
+            call_device_state(pd_2, devices_json.pin_2.state);
+            call_device_state(pd_23, devices_json.pin_23.state);
+        }
+        else {
+            info!("Not found data. Creating a layout data...");
+
+            if let Err(err) = nvs_data.set_default(DEVICES_TAG) {
+                panic!("[ERROR] {err}");
+            }
+            else {
+                info!("Created data layout!");
+            }
+        }
+    }
+    
 
     let _wifi = wifi_create(&sys_loop, &nvs, wifi_ssid, wifi_pass).unwrap();
 
@@ -50,145 +95,15 @@ fn main() -> ! {
     let client = Arc::new(Mutex::new(client));
     let c1 = client.clone();
 
-    let pin_driver_2 = Arc::new(Mutex::new(PinDriver::input_output(peripherals.pins.gpio2).unwrap()));
-    let pin_driver_23 = Arc::new(Mutex::new(PinDriver::input_output(peripherals.pins.gpio23).unwrap()));
-
     let (mut tx1, rx1) = channel::<String>();
     let (mut tx2, rx2) = channel::<String>();
 
     subscribe(c1);
     
-    runner(rx1, pin_driver_2);
-    runner(rx2, pin_driver_23);
+    runner(rx1, nvs_data_clone1, TOPIC_PIN_2, pin_driver_2);
+    runner(rx2, nvs_data_clone2, TOPIC_PIN_23, pin_driver_23);
    
     message_distributor((&mut tx1, TOPIC_PIN_2), (&mut tx2, TOPIC_PIN_23), &mut conn);
     
     loop {}
-}
-
-
-macro_rules! setup_subscribe {
-    ($client:expr, $( $topic:expr ),*) => {
-        $(
-            if let Err(err) = $client.subscribe($topic, QoS::AtMostOnce) {
-                info!("Problem to connect to topic: {err} - \"{}\"", $topic);
-                thread::sleep(Duration::from_millis(2000));
-                continue;
-            }
-        )*
-    };
-}
-
-fn subscribe(
-    client: Arc<Mutex<EspMqttClient<'static>>>
-) {
-    thread::spawn(move || {
-        loop {
-            {
-                let mut client = client.lock().unwrap();
-                info!("Trying to connect to topics");
-
-                setup_subscribe!(client, TOPIC_PIN_2, TOPIC_PIN_23);
-            }  
-            info!("Subscribed to all topics");
-            thread::sleep(Duration::from_millis(5000));
-        }
-    });
-}
-
-fn message_distributor(
-    tx: (&mut Sender<String>, &str),
-    tx2: (&mut Sender<String>, &str),
-    conn: &mut EspMqttConnection
-) {
-    loop {
-        let Ok(event) = conn.next() else {
-            continue;
-        };
-        if let EventPayload::Received { topic, data, .. } = event.payload() {
-            let raw_json = core::str::from_utf8(data).unwrap().to_owned();
-            info!("Topic Received: {topic:#?}");
-            match topic {
-                Some(TOPIC_PIN_2) => tx.0.send(raw_json).unwrap(),
-                Some(TOPIC_PIN_23) => tx2.0.send(raw_json).unwrap(),
-                _ => info!("Cannot find this topic")
-            }
-        }
-    }
-}
-
-fn runner<P: Pin>(
-    rx: Receiver<String>,
-    pin_driver: Arc<Mutex<PinDriver<'static, P, InputOutput>>>
-) {
-    thread::spawn(move || {
-        loop {
-            if let Ok(value) = rx.recv() {
-                let Ok(device) = serde_json::from_str::<Device>(value.as_str()) else {
-                    info!("Impossible to parse data!");
-                    continue;
-                };
-                info!("Device: {device:#?}");
-                if device.state == true {
-                    let mut pin_driver = pin_driver.lock().unwrap();
-                    _ = pin_driver.set_high();
-                } else {
-                    let mut pin_driver = pin_driver.lock().unwrap();
-                    _ = pin_driver.set_low();
-                }
-            } 
-        }
-    });
-
-}
-
-fn mqtt_create<'a>(
-    url: &str,
-    client_id: &str,
-    client_pass: &str
-) -> Result<(EspMqttClient<'static>, EspMqttConnection), EspError> {
-    let (mqtt_client, mqtt_conn) = EspMqttClient::new(
-        url,
-        &MqttClientConfiguration {
-            client_id: Some(client_id),
-            username: Some(client_id),
-            password: Some(client_pass),
-            protocol_version: Some(MqttProtocolVersion::V3_1_1),
-            server_certificate: None,
-            client_certificate: None,
-            ..Default::default()
-        },
-    )?;
-
-    Ok((mqtt_client, mqtt_conn))
-}
-
-fn wifi_create(
-    sys_loop: &EspSystemEventLoop,
-    nvs: &EspDefaultNvsPartition,
-    wifi_ssid: &str,
-    wifi_pass: &str
-) -> Result<EspWifi<'static>, EspError> {
-    let peripherals = Peripherals::take()?;
-
-    let mut esp_wifi = EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs.clone()))?;
-    let mut wifi = BlockingWifi::wrap(&mut esp_wifi, sys_loop.clone())?;
-
-    wifi.set_configuration(&Configuration::Client(ClientConfiguration {
-        ssid: wifi_ssid.try_into().unwrap(),
-        password: wifi_pass.try_into().unwrap(),
-        auth_method: AuthMethod::WPA2Personal,
-        ..Default::default()
-    }))?;
-
-    wifi.start()?;
-    info!("Wifi started");
-
-    wifi.connect()?;
-    info!("Wifi connected");
-
-    wifi.wait_netif_up()?;
-    info!("Wifi netif up");
-
-    Ok(esp_wifi)
 }
