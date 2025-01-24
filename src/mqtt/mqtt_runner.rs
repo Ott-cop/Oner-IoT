@@ -72,7 +72,7 @@ pub fn runner<'a, P: Pin>(
                             {
                                 let dev = devices_json.get_mut(pin_str).unwrap();
                                 let mut device = serde_json::from_value::<Device>(dev.clone()).unwrap();
-                                device.state = true;
+                                device.state = false;
                                 *dev = serde_json::to_value(device).unwrap();
                             }
         

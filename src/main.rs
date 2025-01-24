@@ -71,7 +71,7 @@ fn main() -> ! {
             info!("Found data from NVS!");
             
             let devices_json = serde_json::from_str::<LayoutDataDevice>(data.as_str()).expect("Impossible to parse data");
-
+            
             call_device_state(pd_2, devices_json.pin_2.state);
             call_device_state(pd_23, devices_json.pin_23.state);
         }
